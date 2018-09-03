@@ -1,10 +1,11 @@
 package com.wavesplatform.matcher
 
 import java.io.File
-import java.util.{HashMap => JHashMap}
+import java.nio.ByteBuffer
+import java.util.{HashMap => JHashMap, HashSet => JHashSet}
 
 import com.google.common.base.Charsets.UTF_8
-import com.google.common.primitives.Shorts
+import com.google.common.primitives.{Ints, Shorts}
 import com.typesafe.config.ConfigFactory
 import com.wavesplatform.crypto.DigestSize
 import com.wavesplatform.database.DBExt
@@ -16,10 +17,11 @@ import com.wavesplatform.state.{ByteStr, EitherExt2}
 import org.iq80.leveldb.DB
 import scorex.account.{Address, AddressScheme}
 import scorex.transaction.AssetId
-import scorex.transaction.assets.exchange.AssetPair
+import scorex.transaction.assets.exchange.{AssetPair, Order}
 import scorex.utils.ScorexLogging
 
 import scala.collection.JavaConverters._
+import scala.collection.immutable.Queue
 
 object MigrationTool extends ScorexLogging {
   private def collectStats(db: DB): Unit = {
@@ -168,6 +170,76 @@ object MigrationTool extends ScorexLogging {
     log.info("Completed")
   }
 
+  def createPairIndexes(db: DB): Unit = {
+    import com.wavesplatform.matcher.util.Codecs.ByteBufferExt
+    val currOrderIds: JHashSet[ByteStr] = {
+      val key = Shorts.toByteArray(11) // MatcherKeys.addressOrdersByPairSeqNr
+      val r   = new JHashSet[ByteStr]
+      db.iterateOver(key) { e =>
+        val seqNr = Ints.fromByteArray(e.getValue)
+        if (seqNr > 0) {
+          val skip    = Address.AddressLength + 2
+          val address = Address.fromBytes(e.getKey.slice(2, skip)).explicitGet()
+          val pair    = ByteBuffer.wrap(e.getKey, skip, e.getKey.length - skip).getAssetPair
+          (1 to seqNr).foreach { idx =>
+            val key = MatcherKeys.addressOrdersByPair(address, pair, idx)
+            key.parse(db.get(key.keyBytes)).foreach { orderId =>
+              r.add(orderId)
+            }
+          }
+        }
+      }
+      r
+    }
+    log.info(s"Records in new indexes: ${currOrderIds.size()}")
+
+    val orderRefs: JHashMap[(Address, AssetPair), Queue[Order.Id]] = {
+      log.info("Loading orders")
+      val r   = new JHashMap[(Address, AssetPair), Queue[Order.Id]]()
+      val key = MatcherKeys.orderInfo(ByteStr(Array.emptyByteArray))
+      db.iterateOver(key.keyBytes) { e =>
+        val orderId = ByteStr(new Array[Byte](DigestSize))
+        Array.copy(e.getKey, 2, orderId.arr, 0, DigestSize)
+        db.get(MatcherKeys.order(orderId)).foreach { order =>
+          val key = (order.sender.toAddress, order.assetPair)
+          r.compute(
+            key, { (_, currRefsRaw) =>
+              if (currOrderIds.contains(order.id())) currRefsRaw
+              else
+                Option(currRefsRaw)
+                  .getOrElse(Queue.empty[Order.Id])
+                  .enqueue(order.id())
+            }
+          )
+        }
+      }
+      r
+    }
+
+    var totalRecordsAdded = 0
+    db.readWrite { rw =>
+      orderRefs.forEach { (k, q) =>
+        val (address, pair) = k
+        val seqNrK          = MatcherKeys.addressOrdersByPairSeqNr(address, pair)
+
+        var lastSeqNr = rw.get(seqNrK)
+        var i         = 0
+        q.foreach { orderId =>
+          i += 1
+          lastSeqNr += 1
+          val k = MatcherKeys.addressOrdersByPair(address, pair, lastSeqNr)
+          rw.put(k, Some(orderId))
+        }
+
+        totalRecordsAdded += lastSeqNr
+        rw.put(seqNrK, lastSeqNr)
+        log.info(s"$address added $i orders")
+      }
+    }
+
+    log.info(s"Total records added: $totalRecordsAdded")
+  }
+
   def main(args: Array[String]): Unit = {
     log.info(s"OK, engine start")
 
@@ -182,8 +254,14 @@ object MigrationTool extends ScorexLogging {
     if (args(1) == "stats") {
       collectStats(db)
     } else if (args(1) == "ao") {
-      val o = DBUtils.ordersByAddress(db, Address.fromString(args(2)).explicitGet(), Set.empty, false, Int.MaxValue)
-      println(o.mkString("\n"))
+      if (args.length == 5) {
+        val pair = AssetPair.createAssetPair(args(3), args(4)).get
+        val o    = DBUtils.ordersByAddressAndPair(db, Address.fromString(args(2)).explicitGet(), pair, activeOnly = false)
+        println(o.mkString("\n"))
+      } else {
+        val o = DBUtils.ordersByAddress(db, Address.fromString(args(2)).explicitGet(), Set.empty, activeOnly = false, Int.MaxValue)
+        println(o.mkString("\n"))
+      }
     } else if (args(1) == "cb") {
       recalculateReservedBalance(db)
     } else if (args(1) == "rb") {
@@ -198,6 +276,10 @@ object MigrationTool extends ScorexLogging {
       log.info("Compacting database")
       db.compactRange(null, null)
       log.info("Compaction complete")
+    } else if (args(1) == "create-pair-indexes") {
+      log.info("Creating pair indexes")
+      createPairIndexes(db)
+      log.info("Completed")
     }
 
     db.close()
